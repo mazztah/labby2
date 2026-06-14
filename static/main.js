@@ -1,46 +1,51 @@
 'use strict';
 /* =========================================================
-   Gravity Maze – Frontend
-   Controls: Gyroscope (Android) · Virtual Joystick (Touch) · WASD / Arrows
+   Gravity Maze – Frontend  (v3 – Gyro-Fix)
+   Steuerung: Gyroskop · Virtueller Joystick · WASD / Pfeiltasten
+
+   WICHTIGE GYRO-FIXES gegenüber v2:
+   ① Sensor-Listener schon beim Seitenstart aktiv (nicht erst beim Button)
+   ② Sensor-Check: 600 ms warten → prüfen ob Events ankamen
+   ③ Gyro-Werte im Game-Loop anwenden (nicht im Event-Handler)
+   ④ startGame() resettet nur hasFirstGyro, nicht die geglätteten Werte
+   ⑤ Y-Flip-Button falls Richtung verkehrt
+   ⑥ Klares Debug-Panel mit Live-Werten
    ========================================================= */
 
-// ── DOM refs ──────────────────────────────────────────────────────────────
-const canvas    = document.getElementById('game');
-const ctx       = canvas.getContext('2d');
-const scoreEl   = document.getElementById('score');
-const coinsEl   = document.getElementById('coins');
-const timeEl    = document.getElementById('time');
-const overlay   = document.getElementById('overlay');
-const msgEl     = document.getElementById('msg');
-const btnStart  = document.getElementById('btnStart');
-const btnRestart= document.getElementById('btnRestart');
-const btnGyro   = document.getElementById('btnGyro');
-const btnCalib  = document.getElementById('btnCalib');
-const gyroBadge = document.getElementById('gyroBadge');
-const toast     = document.getElementById('toast');
+// ── DOM-Referenzen ────────────────────────────────────────────────────────
+const canvas     = document.getElementById('game');
+const ctx        = canvas.getContext('2d');
+const scoreEl    = document.getElementById('score');
+const coinsEl    = document.getElementById('coins');
+const timeEl     = document.getElementById('time');
+const overlay    = document.getElementById('overlay');
+const msgEl      = document.getElementById('msg');
+const btnStart   = document.getElementById('btnStart');
+const btnRestart = document.getElementById('btnRestart');
+const btnGyro    = document.getElementById('btnGyro');
+const btnCalib   = document.getElementById('btnCalib');
+const btnFlipY   = document.getElementById('btnFlipY');
+const gyroBadge  = document.getElementById('gyroBadge');
+const toast      = document.getElementById('toast');
 
-// ── Game state ────────────────────────────────────────────────────────────
-let level   = null;
-let tiles   = [];
-let coins   = [];
+// ── Spielzustand ──────────────────────────────────────────────────────────
+let level     = null;
+let tiles     = [];
+let coins     = [];
 let holeTiles = [];
-let ball    = null;
-
-let score   = 0;
-let running = false;
-let lastTs  = 0;
-let startTs = 0;
-
-// ── Target acceleration for physics step ──────────────────────────────────
+let ball      = null;
+let score     = 0;
+let running   = false;
+let lastTs    = 0;
+let startTs   = 0;
 const targetAccel = { x: 0, y: 0 };
 
-// ── Keyboard ──────────────────────────────────────────────────────────────
+// ── Tastatur ──────────────────────────────────────────────────────────────
 const keys = new Set();
-
 window.addEventListener('keydown', e => {
   keys.add(e.key);
   if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',
-       'a','A','w','W','s','S','d','D'].includes(e.key)) e.preventDefault();
+       'a','A','d','D','w','W','s','S'].includes(e.key)) e.preventDefault();
 });
 window.addEventListener('keyup', e => keys.delete(e.key));
 
@@ -50,250 +55,249 @@ function accelFromKeys() {
   if (keys.has('ArrowRight') || keys.has('d') || keys.has('D')) x += 1;
   if (keys.has('ArrowUp')    || keys.has('w') || keys.has('W')) y -= 1;
   if (keys.has('ArrowDown')  || keys.has('s') || keys.has('S')) y += 1;
-  const mag = Math.hypot(x, y);
-  if (mag > 1) { x /= mag; y /= mag; }
+  const m = Math.hypot(x, y);
+  if (m > 1) { x /= m; y /= m; }
   return { x, y };
 }
 
-// ── Virtual joystick ──────────────────────────────────────────────────────
-const JOY_MAX_PX = 56; // max drag distance in CSS pixels
-const JOY_DEAD   = 0.06;
-
-const joy = {
-  active: false,
-  startX: 0, startY: 0,
-  dx: 0, dy: 0,
-};
+// ── Virtueller Joystick ───────────────────────────────────────────────────
+const JOY_R    = 58;
+const JOY_DEAD = 0.05;
+const joy = { active: false, sx: 0, sy: 0, dx: 0, dy: 0 };
 
 canvas.addEventListener('pointerdown', e => {
-  // Don't steal touches in a gyro session but allow joystick fallback
   joy.active = true;
-  joy.startX = e.clientX;
-  joy.startY = e.clientY;
-  joy.dx = 0;
-  joy.dy = 0;
+  joy.sx = e.clientX; joy.sy = e.clientY;
+  joy.dx = 0;         joy.dy = 0;
   canvas.setPointerCapture(e.pointerId);
   e.preventDefault();
 });
-
 canvas.addEventListener('pointermove', e => {
   if (!joy.active) return;
-  joy.dx = e.clientX - joy.startX;
-  joy.dy = e.clientY - joy.startY;
+  joy.dx = e.clientX - joy.sx;
+  joy.dy = e.clientY - joy.sy;
   e.preventDefault();
 });
-
 function endJoy() {
-  joy.active = false;
-  joy.dx = 0;
-  joy.dy = 0;
+  joy.active = false; joy.dx = 0; joy.dy = 0;
   if (!gyroEnabled) { targetAccel.x = 0; targetAccel.y = 0; }
 }
 canvas.addEventListener('pointerup',     endJoy);
 canvas.addEventListener('pointercancel', endJoy);
 
 function accelFromJoy() {
-  const dist = Math.hypot(joy.dx, joy.dy);
-  const scale = Math.min(dist, JOY_MAX_PX) / JOY_MAX_PX;
-  let ax = dist > 0 ? (joy.dx / dist) * scale : 0;
-  let ay = dist > 0 ? (joy.dy / dist) * scale : 0;
+  const d = Math.hypot(joy.dx, joy.dy);
+  const s = Math.min(d, JOY_R) / JOY_R;
+  let ax = d > 0 ? (joy.dx / d) * s : 0;
+  let ay = d > 0 ? (joy.dy / d) * s : 0;
   if (Math.abs(ax) < JOY_DEAD) ax = 0;
   if (Math.abs(ay) < JOY_DEAD) ay = 0;
   return { x: ax, y: ay };
 }
 
-// ── Gyroscope ─────────────────────────────────────────────────────────────
-let gyroEnabled    = false;
-let hasFirstGyro   = false;
+// ═══════════════════════════════════════════════════════════════════════════
+//  GYROSKOP  –  Komplette Neuimplementierung (Fix ①–⑥)
+// ═══════════════════════════════════════════════════════════════════════════
 
-// Calibration offsets (neutral orientation)
-let calibBeta      = 0;
-let calibGamma     = 0;
+// ── FIX ①: Sensor-Events sofort ab Seitenstart sammeln ──────────────────
+//   (nicht erst wenn der Nutzer den Button drückt)
+let rawBeta      = null;   // letzter beta-Wert (null = noch kein Event)
+let rawGamma     = null;   // letzter gamma-Wert
+let sensorCount  = 0;      // Zähler aller eingehenden Events
+let sensorLastMs = 0;      // Zeitstempel des letzten Events
 
-// Smoothed raw sensor values
-let smoothedBeta   = 0;
-let smoothedGamma  = 0;
+window.addEventListener('deviceorientation', e => {
+  // Manche Android-Browser liefern kurz null-Werte – ignorieren
+  if (e.beta == null || !Number.isFinite(+e.beta)) return;
+  rawBeta      = +e.beta;
+  rawGamma     = +(e.gamma ?? 0);
+  sensorCount++;
+  sensorLastMs = Date.now();
+}, false);
 
-// Tunables (Android-friendly)
-const GYRO_ALPHA   = 0.78; // low-pass filter
-const GYRO_RANGE   = 35;   // degrees tilt for max acceleration
-const GYRO_DEAD    = 0.05; // deadzone to fight drift
+// ── Gyro-Zustand ──────────────────────────────────────────────────────────
+let gyroEnabled  = false;
+let hasFirstGyro = false;  // wird beim 1. Loop-Tick nach Aktivierung gesetzt
+let calibBeta    = 0;
+let calibGamma   = 0;
+let smoothBeta   = 0;
+let smoothGamma  = 0;
+let flipY        = false;  // Y-Richtung umkehren (falls verkehrt)
 
-function getScreenRotationDeg() {
-  // Best-effort mapping for device rotation.
-  // Returns 0/90/180/270 (portrait baseline = 0).
-  let angle = 0;
+const GYRO_ALPHA = 0.72;   // Low-pass-Stärke (niedriger = flüssiger, mehr Rauschen)
+const GYRO_RANGE = 26;     // Neigungsgrad für maximale Beschleunigung
+const GYRO_DEAD  = 0.04;   // Deadzone gegen Sensor-Drift
+
+// ── Bildschirmrotation ermitteln ──────────────────────────────────────────
+function getScreenRot() {
   try {
-    if (screen?.orientation && typeof screen.orientation.angle === 'number') {
-      angle = screen.orientation.angle;
-    } else if (typeof window.orientation === 'number') {
-      // legacy iOS/Android: 0, +/-90, 180
-      angle = window.orientation;
+    if (typeof screen?.orientation?.angle === 'number') {
+      return ((screen.orientation.angle % 360) + 360) % 360;
+    }
+    if (typeof window.orientation === 'number') {
+      return ((window.orientation % 360) + 360) % 360;
     }
   } catch (_) {}
-
-  // normalize
-  angle = ((angle % 360) + 360) % 360;
-  // quantize to multiples of 90
-  angle = Math.round(angle / 90) * 90;
-  angle = ((angle % 360) + 360) % 360;
-  return angle;
+  return 0;
 }
 
-// axis mapping: convert (beta,gamma) into game-space accel (x,y)
-function gyroToAccel(beta, gamma) {
-  // Typical Android mapping (portrait):
-  // - gamma (left/right tilt) -> x acceleration
-  // - beta  (front/back tilt) -> y acceleration (often inverted)
+// ── FIX ③: Gyro-Werte im Game-Loop anwenden (nicht im Event-Handler) ─────
+function applyGyro() {
+  if (!gyroEnabled || rawBeta === null) return;
+  // Zu alte Daten? (Sensor eingeschlafen)
+  if (Date.now() - sensorLastMs > 900) return;
 
-  let axPortrait = clamp((gamma - calibGamma) / GYRO_RANGE, -1, 1);
-  let ayPortrait = clamp((beta  - calibBeta)  / GYRO_RANGE, -1, 1);
-
-  // Make “neigen” feel natural: invert Y so pushing the top of the phone away moves down/up as expected.
-  ayPortrait *= -1;
-
-  // Rotate mapping into current screen orientation.
-  // rotation=0: portrait -> (x,y) = (axPortrait, ayPortrait)
-  // rotation=90: rotate right -> (x,y) = (ayPortrait, -axPortrait)
-  // rotation=180: -> (x,y) = (-axPortrait, -ayPortrait)
-  // rotation=270: -> (x,y) = (-ayPortrait, axPortrait)
-  const rot = getScreenRotationDeg();
-  let ax = axPortrait;
-  let ay = ayPortrait;
-  if (rot === 90) {
-    ax = ayPortrait;
-    ay = -axPortrait;
-  } else if (rot === 180) {
-    ax = -axPortrait;
-    ay = -ayPortrait;
-  } else if (rot === 270) {
-    ax = -ayPortrait;
-    ay = axPortrait;
+  // FIX ④: Kalibrieren beim 1. Aufruf (aktuelle Haltung = Nulllage)
+  if (!hasFirstGyro) {
+    calibBeta   = rawBeta;
+    calibGamma  = rawGamma;
+    smoothBeta  = rawBeta;
+    smoothGamma = rawGamma;
+    hasFirstGyro = true;
+    showToast('📐 Kalibriert – jetzt neigen!', 1800);
   }
+
+  // Low-pass-Filter (Jitter glätten)
+  smoothBeta  = GYRO_ALPHA * smoothBeta  + (1 - GYRO_ALPHA) * rawBeta;
+  smoothGamma = GYRO_ALPHA * smoothGamma + (1 - GYRO_ALPHA) * rawGamma;
+
+  // Neigung → Beschleunigung
+  let ax = clamp((smoothGamma - calibGamma) / GYRO_RANGE, -1, 1);
+  let ay = clamp((smoothBeta  - calibBeta)  / GYRO_RANGE, -1, 1);
+
+  // Y-Flip (Knopf für verkehrte Richtung)
+  if (flipY) ay = -ay;
+
+  // Bildschirmrotation kompensieren (Querformat links/rechts)
+  const rot = getScreenRot();
+  if (rot === 90)  { const t = ax; ax =  ay; ay = -t; }
+  if (rot === 180) { ax = -ax; ay = -ay; }
+  if (rot === 270) { const t = ax; ax = -ay; ay =  t; }
 
   // Deadzone
   if (Math.abs(ax) < GYRO_DEAD) ax = 0;
   if (Math.abs(ay) < GYRO_DEAD) ay = 0;
 
-  return { x: ax, y: ay };
+  targetAccel.x = ax;
+  targetAccel.y = ay;
 }
 
-
-function onDeviceOrientation(e) {
-  if (!gyroEnabled || !running) return;
-
-  const betaRaw = e.beta;
-  const gammaRaw = e.gamma;
-
-  // Many Android browsers can send null/undefined or NaN until permission/first update.
-  // In that case we simply ignore the event.
-  if (betaRaw == null || gammaRaw == null) return;
-  const beta = Number(betaRaw);
-  const gamma = Number(gammaRaw);
-  if (!Number.isFinite(beta) || !Number.isFinite(gamma)) return;
-
-  // First reading becomes neutral (so holding phone still = no motion)
-  if (!hasFirstGyro) {
-    calibBeta = beta;
-    calibGamma = gamma;
-    smoothedBeta = beta;
-    smoothedGamma = gamma;
-    hasFirstGyro = true;
-  }
-
-  // Low-pass filter (reduce jitter)
-  smoothedBeta  = GYRO_ALPHA * smoothedBeta  + (1 - GYRO_ALPHA) * beta;
-  smoothedGamma = GYRO_ALPHA * smoothedGamma + (1 - GYRO_ALPHA) * gamma;
-
-  // Convert to game accel
-  const a = gyroToAccel(smoothedBeta, smoothedGamma);
-
-  // Gyro has hard priority: ignore joystick while gyro is active
-  targetAccel.x = a.x;
-  targetAccel.y = a.y;
-}
-
-
+// ── FIX ②: Gyro-Button mit Sensor-Check ──────────────────────────────────
 async function toggleGyro() {
   if (gyroEnabled) {
     gyroEnabled = false;
-    hasFirstGyro = false;
-    targetAccel.x = 0;
-    targetAccel.y = 0;
+    targetAccel.x = 0; targetAccel.y = 0;
     gyroBadge.classList.add('hidden');
     btnGyro.classList.remove('active');
     btnCalib.classList.add('hidden');
-    // Remove listener to avoid duplicate handlers after toggling
-    window.removeEventListener('deviceorientation', onDeviceOrientation);
+    btnFlipY.classList.add('hidden');
+    dbgEl.style.opacity = '0';
     showToast('Gyroskop deaktiviert');
     return;
   }
 
-  // reset neutral state so first valid event re-calibrates
-  hasFirstGyro = false;
-  calibBeta = 0;
-  calibGamma = 0;
-  smoothedBeta = 0;
-  smoothedGamma = 0;
-
-
-
-  // iOS Safari needs explicit permission
+  // iOS Safari braucht explizite Genehmigung
   if (typeof DeviceOrientationEvent !== 'undefined' &&
       typeof DeviceOrientationEvent.requestPermission === 'function') {
     try {
-      const result = await DeviceOrientationEvent.requestPermission();
-      if (result !== 'granted') {
-        showToast('Gyroskop-Zugriff verweigert');
-        return;
-      }
-    } catch (err) {
-      showToast('Gyroskop nicht verfügbar');
-      return;
-    }
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== 'granted') { showToast('❌ Zugriff verweigert'); return; }
+    } catch { showToast('❌ Sensor-Fehler'); return; }
   }
 
-  // Check for sensor support
-  if (!('DeviceOrientationEvent' in window)) {
-    showToast('Dieses Gerät hat kein Gyroskop');
+  // Sensor-Check: 600 ms warten, dann zählen ob Events ankamen
+  const nBefore = sensorCount;
+  showToast('⏳ Sensor wird geprüft…', 900);
+  await new Promise(r => setTimeout(r, 650));
+
+  if (sensorCount === nBefore || rawBeta === null) {
+    // Kein Signal → mit Diagnose-Hinweis abbrechen
+    showToast(
+      '❌ Kein Gyro-Signal!\n' +
+      '→ Seite per HTTPS öffnen (Render ✓)\n' +
+      '→ Chrome: Einstellungen › Bewegungssensoren\n' +
+      '→ Gerät hat möglicherweise kein Gyroskop',
+      5000
+    );
     return;
   }
 
-  gyroEnabled = true;
-  hasFirstGyro = false;
-  window.addEventListener('deviceorientation', onDeviceOrientation);
+  // Alles OK → aktivieren
+  gyroEnabled  = true;
+  hasFirstGyro = false;   // kalibriert beim ersten Loop-Tick (FIX ③/④)
   gyroBadge.classList.remove('hidden');
   btnGyro.classList.add('active');
   btnCalib.classList.remove('hidden');
-  showToast('Gyroskop aktiv – Handy neigen zum Spielen');
+  btnFlipY.classList.remove('hidden');
+  showToast('📡 Gyro aktiv – Handy neigen zum Spielen');
 }
 
+// Neu-Kalibrierung: aktuelle Haltung = Nulllage
 function calibrateGyro() {
-  // Use current smoothed values as neutral reference
-  calibBeta  = smoothedBeta;
-  calibGamma = smoothedGamma;
-  hasFirstGyro = true;
-  showToast('Kalibriert! Aktuelle Position = Neutral');
+  hasFirstGyro = false;
+  showToast('📐 Halte in Spielposition…', 1200);
 }
 
+// FIX ⑤: Y-Achse umkehren, falls Kugel falsch reagiert
+function toggleFlipY() {
+  flipY = !flipY;
+  btnFlipY.classList.toggle('active', flipY);
+  showToast(flipY ? '↕ Y-Achse gespiegelt' : '↕ Y-Achse normal');
+}
 
-btnGyro.addEventListener('click', toggleGyro);
+btnGyro.addEventListener('click',  toggleGyro);
 btnCalib.addEventListener('click', calibrateGyro);
+btnFlipY.addEventListener('click', toggleFlipY);
 
-// ── Toast helper ──────────────────────────────────────────────────────────
+// ── FIX ⑥: Debug-Panel (live) ─────────────────────────────────────────────
+const dbgEl = (() => {
+  const el = document.createElement('div');
+  Object.assign(el.style, {
+    position:'fixed', left:'10px', bottom:'88px', zIndex:'60',
+    padding:'9px 11px', borderRadius:'12px',
+    background:'rgba(7,10,18,.88)',
+    border:'1px solid rgba(122,169,255,.35)',
+    color:'#c8daff', fontSize:'11.5px',
+    fontFamily:'ui-monospace,SFMono-Regular,monospace',
+    pointerEvents:'none', whiteSpace:'pre', lineHeight:'1.5',
+    maxWidth:'min(340px,calc(100vw - 20px))',
+    opacity:'0', transition:'opacity .25s',
+    boxShadow:'0 4px 20px rgba(0,0,0,.4)',
+  });
+  document.body.appendChild(el);
+  return el;
+})();
+
+function updateDebug() {
+  const show = gyroEnabled;
+  dbgEl.style.opacity = show ? '1' : '0';
+  if (!show) return;
+  const fresh = (Date.now() - sensorLastMs) < 900;
+  const sigIcon = fresh ? '🟢' : (sensorCount > 0 ? '🟡' : '🔴');
+  dbgEl.textContent =
+    `Sensor  ${sigIcon} ${sensorCount} Events\n` +
+    `β raw   ${rawBeta  !== null ? rawBeta.toFixed(1).padStart(7) : '   null'}\n` +
+    `γ raw   ${rawGamma !== null ? rawGamma.toFixed(1).padStart(7) : '   null'}\n` +
+    `β-cal   ${(smoothBeta  - calibBeta).toFixed(1).padStart(7)}\n` +
+    `γ-cal   ${(smoothGamma - calibGamma).toFixed(1).padStart(7)}\n` +
+    `accel   x${targetAccel.x.toFixed(2)} y${targetAccel.y.toFixed(2)}\n` +
+    `flipY:${flipY}  rot:${getScreenRot()}°`;
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────
 let toastTimer = null;
-function showToast(msg, durationMs = 2200) {
+function showToast(msg, ms = 2200) {
   toast.textContent = msg;
   toast.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.add('hidden'), durationMs);
+  toastTimer = setTimeout(() => toast.classList.add('hidden'), ms);
 }
 
-// ── Canvas resizing ───────────────────────────────────────────────────────
+// ── Canvas-Größe ──────────────────────────────────────────────────────────
 function resizeCanvas() {
-  const w   = window.innerWidth;
-  const h   = window.innerHeight;
   const dpr = window.devicePixelRatio || 1;
+  const w = window.innerWidth;
+  const h = window.innerHeight;
   canvas.width  = Math.round(w * dpr);
   canvas.height = Math.round(h * dpr);
   canvas.style.width  = w + 'px';
@@ -304,41 +308,37 @@ function resizeCanvas() {
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// ── Hilfsfunktionen ───────────────────────────────────────────────────────
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function hideOverlay() { overlay.classList.add('hidden'); }
 function showOverlay() { overlay.classList.remove('hidden'); }
 
-// ── World → Screen coordinate mapping ────────────────────────────────────
+// ── Welt → Bildschirm-Koordinaten ────────────────────────────────────────
 function worldToScreen(wx, wy) {
   const W   = window.innerWidth;
   const H   = window.innerHeight;
   const tw  = level.world_width_tiles;
   const th  = level.world_height_tiles;
-  const pad = 54;                             // leave space for HUD / ctrl-bar
-  const avW = W - pad * 2;
-  const avH = H - pad * 2;
-  const tpx = Math.min(avW / tw, avH / th);
+  const pad = 56;
+  const tpx = Math.min((W - pad * 2) / tw, (H - pad * 2) / th);
   const ox  = (W - tpx * tw) / 2;
   const oy  = (H - tpx * th) / 2;
   return { sx: ox + wx * tpx, sy: oy + wy * tpx, tpx };
 }
 
-// ── Load level from backend ───────────────────────────────────────────────
+// ── Level vom Backend laden ───────────────────────────────────────────────
 async function loadLevel() {
   const res = await fetch('/api/level');
   if (!res.ok) throw new Error(`Level HTTP ${res.status}`);
-  level    = await res.json();
-  tiles    = level.tiles;
-  coins    = level.coins.map(c => ({ ...c, collected: false }));
-  holeTiles= level.hole_tiles || [];
-
+  level     = await res.json();
+  tiles     = level.tiles;
+  coins     = level.coins.map(c => ({ ...c, collected: false }));
+  holeTiles = level.hole_tiles || [];
   ball = {
     pos: { x: level.start.x, y: level.start.y },
     vel: { x: 0, y: 0 },
     radius: 0.22,
   };
-
   score = 0;
   scoreEl.textContent = '0';
   coinsEl.textContent = `0/${coins.length}`;
@@ -351,7 +351,6 @@ async function loadLevel() {
 // ── Rendering ─────────────────────────────────────────────────────────────
 function draw() {
   if (!level || !ball) return;
-
   const W = window.innerWidth;
   const H = window.innerHeight;
   ctx.clearRect(0, 0, W, H);
@@ -360,9 +359,9 @@ function draw() {
   const tw = level.world_width_tiles;
   const th = level.world_height_tiles;
 
-  // Faint grid
+  // Gitter
   ctx.save();
-  ctx.strokeStyle = 'rgba(130,160,255,.08)';
+  ctx.strokeStyle = 'rgba(130,160,255,.07)';
   ctx.lineWidth = 0.5;
   for (let i = 0; i <= tw; i++) {
     const x = ox + i * tpx;
@@ -374,150 +373,129 @@ function draw() {
   }
   ctx.restore();
 
-  // Walls
+  // Wände (Außenfläche + Bevel)
   ctx.fillStyle = '#2A3256';
-  for (const t of tiles) {
-    if (t.type === 'WALL') {
-      ctx.fillRect(ox + t.x * tpx, oy + t.y * tpx, tpx + 0.5, tpx + 0.5);
-    }
-  }
+  for (const t of tiles) if (t.type === 'WALL')
+    ctx.fillRect(ox + t.x * tpx, oy + t.y * tpx, tpx + 0.5, tpx + 0.5);
+  ctx.fillStyle = 'rgba(15,22,55,.65)';
+  for (const t of tiles) if (t.type === 'WALL')
+    ctx.fillRect(ox + t.x * tpx + 2, oy + t.y * tpx + 2, tpx - 3.5, tpx - 3.5);
 
-  // Wall inner bevel / depth
-  ctx.fillStyle = 'rgba(20,30,70,.6)';
-  for (const t of tiles) {
-    if (t.type === 'WALL') {
-      ctx.fillRect(ox + t.x * tpx + 2, oy + t.y * tpx + 2, tpx - 3, tpx - 3);
-    }
-  }
-
-  // Goal
+  // Ziel
   for (const t of tiles) {
     if (t.type !== 'GOAL') continue;
     const cx = ox + (t.x + 0.5) * tpx;
     const cy = oy + (t.y + 0.5) * tpx;
-    const r  = tpx * 0.35;
-
-    const pulse = 0.88 + 0.12 * Math.sin(Date.now() / 300);
+    const r  = tpx * 0.34;
+    const p  = 0.87 + 0.13 * Math.sin(Date.now() / 290);
     ctx.save();
-    ctx.shadowColor = 'rgba(60,255,143,.7)';
-    ctx.shadowBlur  = 14;
-    ctx.fillStyle   = `rgba(60,255,143,${0.85 * pulse})`;
-    ctx.beginPath(); ctx.arc(cx, cy, r * pulse, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = 'rgba(60,255,143,.5)';
-    ctx.lineWidth   = 2;
-    ctx.beginPath(); ctx.arc(cx, cy, r * 1.3, 0, Math.PI * 2); ctx.stroke();
+    ctx.shadowColor = 'rgba(60,255,143,.75)'; ctx.shadowBlur = 14;
+    ctx.fillStyle   = `rgba(60,255,143,${0.85 * p})`;
+    ctx.beginPath(); ctx.arc(cx, cy, r * p, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(60,255,143,.45)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(cx, cy, r * 1.35, 0, Math.PI * 2); ctx.stroke();
     ctx.restore();
   }
 
-  // Coins
+  // Münzen
   for (const t of tiles) {
     if (t.type !== 'COIN') continue;
     const c = coins.find(c => c.x === t.x && c.y === t.y);
-    if (c?.collected) continue; // skip collected coins
+    if (c?.collected) continue;
     const cx = ox + (t.x + 0.5) * tpx;
     const cy = oy + (t.y + 0.5) * tpx;
-    const r  = tpx * 0.20;
+    const r  = tpx * 0.19;
     ctx.save();
-    ctx.shadowColor = 'rgba(255,211,77,.5)';
-    ctx.shadowBlur  = 6;
-    ctx.fillStyle   = '#FFD34D';
+    ctx.shadowColor = 'rgba(255,211,77,.5)'; ctx.shadowBlur = 6;
+    ctx.fillStyle = '#FFD34D';
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
-    // shine
     ctx.fillStyle = 'rgba(255,255,255,.55)';
-    ctx.beginPath(); ctx.arc(cx - r * .25, cy - r * .25, r * .35, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx - r * .24, cy - r * .24, r * .34, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
 
-  // Holes
+  // Löcher
   for (const t of holeTiles) {
     const cx = ox + (t.x + 0.5) * tpx;
     const cy = oy + (t.y + 0.5) * tpx;
     const r  = tpx * 0.28;
     ctx.save();
-    ctx.shadowColor = 'rgba(110,76,255,.8)';
-    ctx.shadowBlur  = 10;
+    ctx.shadowColor = 'rgba(110,76,255,.8)'; ctx.shadowBlur = 10;
     const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
-    g.addColorStop(0, 'rgba(30,0,80,1)');
-    g.addColorStop(1, 'rgba(110,76,255,.8)');
+    g.addColorStop(0, 'rgba(20,0,60,1)');
+    g.addColorStop(1, 'rgba(110,76,255,.85)');
     ctx.fillStyle = g;
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
 
-  // Ball trail
+  // Ball-Trail
   const bcx = ox + ball.pos.x * tpx;
   const bcy = oy + ball.pos.y * tpx;
   const br  = ball.radius * tpx;
-  const vx  = ball.vel.x, vy = ball.vel.y;
-  const trailLen = 14;
-  const tx  = bcx - vx * tpx * 0.055 * trailLen;
-  const ty  = bcy - vy * tpx * 0.055 * trailLen;
+  const tvx = ball.vel.x * tpx * 0.05;
+  const tvy = ball.vel.y * tpx * 0.05;
   ctx.save();
-  ctx.globalAlpha = 0.30;
-  ctx.strokeStyle = 'rgba(122,169,255,.85)';
+  ctx.globalAlpha = 0.28;
+  ctx.strokeStyle = 'rgba(122,169,255,.9)';
   ctx.lineWidth   = Math.max(1.5, br * 0.22);
   ctx.lineCap     = 'round';
-  ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(bcx, bcy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(bcx - tvx * 14, bcy - tvy * 14); ctx.lineTo(bcx, bcy); ctx.stroke();
   ctx.restore();
 
   // Ball
   ctx.save();
-  ctx.shadowColor = 'rgba(122,169,255,.65)';
-  ctx.shadowBlur  = 18;
+  ctx.shadowColor = 'rgba(122,169,255,.7)'; ctx.shadowBlur = 20;
   const bg = ctx.createRadialGradient(bcx - br * .3, bcy - br * .3, br * .05, bcx, bcy, br);
-  bg.addColorStop(0, '#A8C8FF');
-  bg.addColorStop(1, '#4A80E0');
+  bg.addColorStop(0, '#B0CCFF');
+  bg.addColorStop(1, '#4078D8');
   ctx.fillStyle = bg;
   ctx.beginPath(); ctx.arc(bcx, bcy, br, 0, Math.PI * 2); ctx.fill();
-  // specular
-  ctx.fillStyle = 'rgba(255,255,255,.72)';
+  ctx.fillStyle = 'rgba(255,255,255,.7)';
   ctx.beginPath(); ctx.arc(bcx - br * .28, bcy - br * .28, br * .22, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
 
-  // Virtual joystick indicator
+  // Joystick-Overlay
   if (joy.active && !gyroEnabled) {
-    const jx = joy.startX;
-    const jy = joy.startY;
-    const dist = Math.hypot(joy.dx, joy.dy);
-    const clamped = Math.min(dist, JOY_MAX_PX);
-    const angle   = Math.atan2(joy.dy, joy.dx);
-    const knobX   = jx + Math.cos(angle) * clamped;
-    const knobY   = jy + Math.sin(angle) * clamped;
-
+    const d   = Math.hypot(joy.dx, joy.dy);
+    const cl  = Math.min(d, JOY_R);
+    const ang = Math.atan2(joy.dy, joy.dx);
+    const kx  = joy.sx + Math.cos(ang) * cl;
+    const ky  = joy.sy + Math.sin(ang) * cl;
     ctx.save();
-    ctx.globalAlpha = 0.5;
-    ctx.strokeStyle = 'rgba(122,169,255,.7)';
-    ctx.lineWidth   = 1.5;
-    ctx.beginPath(); ctx.arc(jx, jy, JOY_MAX_PX, 0, Math.PI * 2); ctx.stroke();
-    ctx.globalAlpha = 0.75;
-    ctx.fillStyle   = 'rgba(122,169,255,.35)';
-    ctx.beginPath(); ctx.arc(jx, jy, 14, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle   = 'rgba(255,255,255,.9)';
-    ctx.beginPath(); ctx.arc(knobX, knobY, 20, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.48;
+    ctx.strokeStyle = 'rgba(122,169,255,.75)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(joy.sx, joy.sy, JOY_R, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = 'rgba(122,169,255,.3)';
+    ctx.beginPath(); ctx.arc(joy.sx, joy.sy, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.88)';
+    ctx.beginPath(); ctx.arc(kx, ky, 20, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
 
-  // Gyro tilt indicator (top-right mini compass)
+  // Gyro-Tilt-Kreis (Mini-Kompass oben rechts)
   if (gyroEnabled) {
-    const ix  = W - 44;
-    const iy  = 88;
-    const ir  = 16;
-    const ax  = targetAccel.x;
-    const ay  = targetAccel.y;
+    const ix = W - 40, iy = 86, ir = 14;
     ctx.save();
-    ctx.globalAlpha = 0.75;
-    ctx.strokeStyle = 'rgba(122,169,255,.5)';
-    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.7;
+    ctx.strokeStyle = 'rgba(122,169,255,.55)'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.arc(ix, iy, ir, 0, Math.PI * 2); ctx.stroke();
-    ctx.fillStyle = 'rgba(122,169,255,.9)';
-    ctx.beginPath(); ctx.arc(ix + ax * ir, iy + ay * ir, 5, 0, Math.PI * 2); ctx.fill();
+    // Achsenlinien
+    ctx.strokeStyle = 'rgba(122,169,255,.25)';
+    ctx.beginPath(); ctx.moveTo(ix - ir, iy); ctx.lineTo(ix + ir, iy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ix, iy - ir); ctx.lineTo(ix, iy + ir); ctx.stroke();
+    // Dot
+    ctx.fillStyle = 'rgba(122,169,255,.95)';
+    ctx.beginPath();
+    ctx.arc(ix + targetAccel.x * ir, iy + targetAccel.y * ir, 4.5, 0, Math.PI * 2);
+    ctx.fill();
     ctx.restore();
   }
 }
 
-// ── Physics tick (HTTP to backend) ───────────────────────────────────────
+// ── Physik-Tick (HTTP → Backend) ─────────────────────────────────────────
 let physicsInFlight = false;
-
 async function physicsTick(dt) {
   if (!running || physicsInFlight) return;
   physicsInFlight = true;
@@ -528,9 +506,9 @@ async function physicsTick(dt) {
       body: JSON.stringify({
         accel:      { x: targetAccel.x, y: targetAccel.y },
         dt_seconds: dt,
-        ball:       ball,
-        tiles:      tiles,
-        coins:      coins,
+        ball,
+        tiles,
+        coins,
       }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -543,24 +521,18 @@ async function physicsTick(dt) {
       score += out.score_delta;
       scoreEl.textContent = String(score);
     }
-
     const collected = coins.filter(c => c.collected).length;
     coinsEl.textContent = `${collected}/${coins.length}`;
 
     if (out.game_over) {
-      running = false;
-      btnRestart.disabled = false;
-      msgEl.textContent   = '💥 Game Over – Ins Loch gefallen!';
-      showOverlay();
-      return;
+      running = false; btnRestart.disabled = false;
+      msgEl.textContent = '💥 Game Over – Ins Loch gefallen!';
+      showOverlay(); return;
     }
-
     if (out.level_completed) {
-      running = false;
-      btnRestart.disabled = false;
-      msgEl.textContent   = `🎉 Level geschafft! +${out.score_delta} Punkte!`;
-      showOverlay();
-      return;
+      running = false; btnRestart.disabled = false;
+      msgEl.textContent = `🎉 Level geschafft! +${out.score_delta} Punkte!`;
+      showOverlay(); return;
     }
   } catch (err) {
     console.error('physicsTick:', err);
@@ -569,32 +541,27 @@ async function physicsTick(dt) {
   }
 }
 
-// ── Main game loop ────────────────────────────────────────────────────────
+// ── Game-Loop ─────────────────────────────────────────────────────────────
 function loop(ts) {
-  if (!running) {
-    draw();
-    return;
-  }
+  if (!running) { draw(); return; }
 
   const dt = Math.min(0.04, (ts - lastTs) / 1000 || 0.016);
-  lastTs   = ts;
+  lastTs = ts;
   timeEl.textContent = ((ts - startTs) / 1000).toFixed(1) + 's';
 
-  // Priority: gyro > joystick > keyboard
-  if (!gyroEnabled) {
-    if (joy.active) {
-      const j = accelFromJoy();
-      targetAccel.x = j.x;
-      targetAccel.y = j.y;
-    } else if (keys.size > 0) {
-      const k = accelFromKeys();
-      targetAccel.x = k.x;
-      targetAccel.y = k.y;
-    } else {
-      // Decay toward zero for smooth stop
-      targetAccel.x *= 0.85;
-      targetAccel.y *= 0.85;
-    }
+  // Eingabe-Priorität: Gyro > Joystick > Tastatur > Abklingen
+  if (gyroEnabled) {
+    applyGyro();             // FIX ③: im Loop anwenden, nicht im Event-Handler
+    updateDebug();           // FIX ⑥: Debug-Panel live aktualisieren
+  } else if (joy.active) {
+    const j = accelFromJoy();
+    targetAccel.x = j.x; targetAccel.y = j.y;
+  } else if (keys.size > 0) {
+    const k = accelFromKeys();
+    targetAccel.x = k.x; targetAccel.y = k.y;
+  } else {
+    targetAccel.x *= 0.84;
+    targetAccel.y *= 0.84;
   }
 
   physicsTick(dt).finally(() => {
@@ -603,10 +570,15 @@ function loop(ts) {
   });
 }
 
-// ── Start game ────────────────────────────────────────────────────────────
+// ── Spiel starten ─────────────────────────────────────────────────────────
 function startGame() {
   if (!level) return;
   running = true;
+
+  // FIX ④: Gyro-Kalibrierung NICHT zurücksetzen (keine Null-Initialisierung)
+  // Nur hasFirstGyro = false → beim 1. Loop-Tick wird mit echter Sensorlage kalibriert
+  if (gyroEnabled) hasFirstGyro = false;
+
   hideOverlay();
   btnRestart.disabled = false;
   startTs = performance.now();
@@ -616,7 +588,7 @@ function startGame() {
   requestAnimationFrame(loop);
 }
 
-// ── Button handlers ───────────────────────────────────────────────────────
+// ── Button-Handler ────────────────────────────────────────────────────────
 btnStart.addEventListener('click', async () => {
   try {
     btnStart.disabled = true;
@@ -640,7 +612,7 @@ btnRestart.addEventListener('click', async () => {
   }
 });
 
-// ── Boot ──────────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────
 (async () => {
   try {
     await loadLevel();

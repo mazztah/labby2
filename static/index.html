@@ -12,10 +12,9 @@
 </head>
 <body>
 
-  <!-- Full-screen game canvas -->
   <canvas id="game"></canvas>
 
-  <!-- HUD floating over canvas -->
+  <!-- HUD (oben schwebend) -->
   <div class="hud">
     <div class="hud-brand">⚫ Gravity Maze</div>
     <div class="hud-stats">
@@ -25,27 +24,28 @@
     </div>
   </div>
 
-  <!-- Gyro indicator badge (shown when gyro is active) -->
+  <!-- Gyro-Badge -->
   <div id="gyroBadge" class="gyro-badge hidden">📡 Gyro aktiv</div>
 
-  <!-- Bottom control bar -->
+  <!-- Steuerleiste (unten) -->
   <div class="ctrl-bar">
-    <button id="btnGyro"  class="cbtn"  title="Gyroskop ein/aus">📡 Gyro</button>
-    <button id="btnCalib" class="cbtn ghost hidden" title="Aktuelle Position als Nulllage kalibrieren">📐 Kalib.</button>
+    <button id="btnGyro"    class="cbtn"        title="Gyroskop ein/aus">📡 Gyro</button>
+    <button id="btnCalib"   class="cbtn ghost hidden" title="Neu kalibrieren">📐 Kalib.</button>
+    <button id="btnFlipY"   class="cbtn ghost hidden" title="Y-Richtung umkehren">↕ Y-Flip</button>
     <button id="btnRestart" class="cbtn" disabled>↺ Neustart</button>
   </div>
 
-  <!-- Toast for brief notifications -->
+  <!-- Toast -->
   <div id="toast" class="toast hidden"></div>
 
-  <!-- Start / GameOver overlay -->
+  <!-- Start-/Game-Over-Overlay -->
   <div id="overlay" class="overlay">
     <div class="card">
-      <h1>Gravity Maze</h1>
+      <h1>⚫ Gravity Maze</h1>
       <p class="muted">
-        Neige dein Handy (Gyroskop), ziehe mit dem Finger oder benutze <b>WASD</b> /
-        Pfeiltasten, um die Kugel zu steuern.<br>
-        Sammle <span class="gold">Münzen</span> und erreiche das
+        Neige dein Handy (<b>📡 Gyro</b>-Button), ziehe mit dem Finger oder
+        benutze <b>WASD</b> / Pfeiltasten.<br><br>
+        Sammle <span class="gold">Münzen</span> &amp; erreiche das
         <span class="green">Ziel</span>. Meide die <span class="purple">Löcher</span>!
       </p>
       <div class="btnrow">
