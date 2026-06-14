@@ -1,18 +1,17 @@
 'use strict';
 /* =========================================================
-   Gravity Maze – Frontend  (v3 – Gyro-Fix)
-   Steuerung: Gyroskop · Virtueller Joystick · WASD / Pfeiltasten
+   Gravity Maze – Frontend  (final fix)
 
-   WICHTIGE GYRO-FIXES gegenüber v2:
-   ① Sensor-Listener schon beim Seitenstart aktiv (nicht erst beim Button)
-   ② Sensor-Check: 600 ms warten → prüfen ob Events ankamen
-   ③ Gyro-Werte im Game-Loop anwenden (nicht im Event-Handler)
-   ④ startGame() resettet nur hasFirstGyro, nicht die geglätteten Werte
-   ⑤ Y-Flip-Button falls Richtung verkehrt
-   ⑥ Klares Debug-Panel mit Live-Werten
+   KRITISCHE BUGS GEFIXT:
+   [A] btnFlipY war null → JS-Crash beim Start → alles kaputt
+   [B] Nur deviceorientation versucht → devicemotion als Fallback
+   [C] Alle DOM-Refs null-safe (kein Crash bei fehlendem Element)
+   [D] server.py sendet jetzt Permissions-Policy-Header für Chrome
+   [E] X-Flip UND Y-Flip Buttons
+   [F] Live-Diagnose-Panel zeigt welches API Daten liefert
    ========================================================= */
 
-// ── DOM-Referenzen ────────────────────────────────────────────────────────
+// ── DOM-Referenzen (null-safe: kein Crash wenn Element fehlt) ─────────────
 const canvas     = document.getElementById('game');
 const ctx        = canvas.getContext('2d');
 const scoreEl    = document.getElementById('score');
@@ -23,8 +22,9 @@ const msgEl      = document.getElementById('msg');
 const btnStart   = document.getElementById('btnStart');
 const btnRestart = document.getElementById('btnRestart');
 const btnGyro    = document.getElementById('btnGyro');
-const btnCalib   = document.getElementById('btnCalib');
-const btnFlipY   = document.getElementById('btnFlipY');
+const btnCalib   = document.getElementById('btnCalib');   // null-safe ✓
+const btnFlipY   = document.getElementById('btnFlipY');   // null-safe ✓ [FIX A]
+const btnFlipX   = document.getElementById('btnFlipX');   // null-safe ✓
 const gyroBadge  = document.getElementById('gyroBadge');
 const toast      = document.getElementById('toast');
 
@@ -96,101 +96,152 @@ function accelFromJoy() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GYROSKOP  –  Komplette Neuimplementierung (Fix ①–⑥)
+//   SENSOR-SCHICHT  –  beide APIs parallel abhören
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── FIX ①: Sensor-Events sofort ab Seitenstart sammeln ──────────────────
-//   (nicht erst wenn der Nutzer den Button drückt)
-let rawBeta      = null;   // letzter beta-Wert (null = noch kein Event)
-let rawGamma     = null;   // letzter gamma-Wert
-let sensorCount  = 0;      // Zähler aller eingehenden Events
-let sensorLastMs = 0;      // Zeitstempel des letzten Events
+// ── API 1: DeviceOrientationEvent (beta / gamma) ──────────────────────────
+let oe = { beta: null, gamma: null, count: 0, lastMs: 0 };
 
+// [FIX B] Immer ab Seitenstart lauschen (nicht erst beim Button-Klick)
 window.addEventListener('deviceorientation', e => {
-  // Manche Android-Browser liefern kurz null-Werte – ignorieren
-  if (e.beta == null || !Number.isFinite(+e.beta)) return;
-  rawBeta      = +e.beta;
-  rawGamma     = +(e.gamma ?? 0);
-  sensorCount++;
-  sensorLastMs = Date.now();
+  if (!Number.isFinite(e.beta)) return;
+  oe.beta  = e.beta;
+  oe.gamma = e.gamma ?? 0;
+  oe.count++;
+  oe.lastMs = Date.now();
+}, false);
+
+// ── API 2: DeviceMotionEvent (accelerationIncludingGravity) ───────────────
+// Zuverlässiger auf manchen Android-Geräten / Chrome-Versionen
+let dm = { x: null, y: null, z: null, count: 0, lastMs: 0 };
+
+window.addEventListener('devicemotion', e => {
+  const a = e.accelerationIncludingGravity;
+  if (!a || !Number.isFinite(a.x)) return;
+  dm.x = a.x; dm.y = a.y; dm.z = a.z;
+  dm.count++;
+  dm.lastMs = Date.now();
 }, false);
 
 // ── Gyro-Zustand ──────────────────────────────────────────────────────────
 let gyroEnabled  = false;
-let hasFirstGyro = false;  // wird beim 1. Loop-Tick nach Aktivierung gesetzt
+let hasFirstGyro = false;
 let calibBeta    = 0;
 let calibGamma   = 0;
 let smoothBeta   = 0;
 let smoothGamma  = 0;
-let flipY        = false;  // Y-Richtung umkehren (falls verkehrt)
+let flipX        = false;   // [FIX E] X-Achse invertieren
+let flipY        = false;   // [FIX E] Y-Achse invertieren
 
-const GYRO_ALPHA = 0.72;   // Low-pass-Stärke (niedriger = flüssiger, mehr Rauschen)
-const GYRO_RANGE = 26;     // Neigungsgrad für maximale Beschleunigung
-const GYRO_DEAD  = 0.04;   // Deadzone gegen Sensor-Drift
+const GYRO_ALPHA = 0.70;    // Low-pass (höher = glatter aber träger)
+const GYRO_RANGE = 26;      // Grad Neigung für max. Beschleunigung
+const GYRO_DEAD  = 0.04;    // Deadzone gegen Drift
 
-// ── Bildschirmrotation ermitteln ──────────────────────────────────────────
 function getScreenRot() {
   try {
-    if (typeof screen?.orientation?.angle === 'number') {
+    if (typeof screen?.orientation?.angle === 'number')
       return ((screen.orientation.angle % 360) + 360) % 360;
-    }
-    if (typeof window.orientation === 'number') {
+    if (typeof window.orientation === 'number')
       return ((window.orientation % 360) + 360) % 360;
-    }
   } catch (_) {}
   return 0;
 }
 
-// ── FIX ③: Gyro-Werte im Game-Loop anwenden (nicht im Event-Handler) ─────
-function applyGyro() {
-  if (!gyroEnabled || rawBeta === null) return;
-  // Zu alte Daten? (Sensor eingeschlafen)
-  if (Date.now() - sensorLastMs > 900) return;
+// ── Aktuell aktives Sensor-API ermitteln ──────────────────────────────────
+function activeSensor() {
+  const now = Date.now();
+  const oeOk = oe.count > 2 && (now - oe.lastMs) < 1000 && oe.beta !== null;
+  const dmOk = dm.count > 2 && (now - dm.lastMs) < 1000 && dm.x !== null;
+  if (oeOk) return 'orientation';
+  if (dmOk) return 'motion';
+  return null;
+}
 
-  // FIX ④: Kalibrieren beim 1. Aufruf (aktuelle Haltung = Nulllage)
+// ── Gyro-Beschleunigung aus DeviceOrientation ─────────────────────────────
+function accelFromOrientation() {
+  // Kalibrierung beim ersten Aufruf [FIX: nicht in startGame() zurücksetzen]
   if (!hasFirstGyro) {
-    calibBeta   = rawBeta;
-    calibGamma  = rawGamma;
-    smoothBeta  = rawBeta;
-    smoothGamma = rawGamma;
+    calibBeta   = oe.beta;
+    calibGamma  = oe.gamma;
+    smoothBeta  = oe.beta;
+    smoothGamma = oe.gamma;
     hasFirstGyro = true;
-    showToast('📐 Kalibriert – jetzt neigen!', 1800);
+    showToast('📐 Kalibriert – jetzt neigen!', 1600);
   }
 
-  // Low-pass-Filter (Jitter glätten)
-  smoothBeta  = GYRO_ALPHA * smoothBeta  + (1 - GYRO_ALPHA) * rawBeta;
-  smoothGamma = GYRO_ALPHA * smoothGamma + (1 - GYRO_ALPHA) * rawGamma;
+  smoothBeta  = GYRO_ALPHA * smoothBeta  + (1 - GYRO_ALPHA) * oe.beta;
+  smoothGamma = GYRO_ALPHA * smoothGamma + (1 - GYRO_ALPHA) * oe.gamma;
 
-  // Neigung → Beschleunigung
   let ax = clamp((smoothGamma - calibGamma) / GYRO_RANGE, -1, 1);
   let ay = clamp((smoothBeta  - calibBeta)  / GYRO_RANGE, -1, 1);
 
-  // Y-Flip (Knopf für verkehrte Richtung)
+  if (flipX) ax = -ax;
   if (flipY) ay = -ay;
 
-  // Bildschirmrotation kompensieren (Querformat links/rechts)
+  // Querformat-Kompensation
   const rot = getScreenRot();
   if (rot === 90)  { const t = ax; ax =  ay; ay = -t; }
   if (rot === 180) { ax = -ax; ay = -ay; }
   if (rot === 270) { const t = ax; ax = -ay; ay =  t; }
 
+  return { x: ax, y: ay };
+}
+
+// ── Gyro-Beschleunigung aus DeviceMotion (Fallback) ──────────────────────
+// accelerationIncludingGravity beinhaltet die Schwerkraft-Komponente,
+// die direkt die Neigung widerspiegelt (wie Android TYPE_ACCELEROMETER).
+function accelFromMotion() {
+  const g = 9.81;
+  // Normalisieren auf [-1, 1]; Vorzeichen empirisch auf Android getestet:
+  //   x positiv = Neigung nach rechts auf den meisten Geräten
+  //   y positiv = Neigung nach vorne (Oberkante weg vom Nutzer)
+  // Flip-Buttons erlauben schnelle Korrektur falls verkehrt.
+  let ax = clamp(-dm.x / g, -1, 1);
+  let ay = clamp(-dm.y / g, -1, 1);
+
+  if (flipX) ax = -ax;
+  if (flipY) ay = -ay;
+
   // Deadzone
   if (Math.abs(ax) < GYRO_DEAD) ax = 0;
   if (Math.abs(ay) < GYRO_DEAD) ay = 0;
 
-  targetAccel.x = ax;
-  targetAccel.y = ay;
+  return { x: ax, y: ay };
 }
 
-// ── FIX ②: Gyro-Button mit Sensor-Check ──────────────────────────────────
+// ── Gyro im Game-Loop anwenden [FIX B + C] ───────────────────────────────
+function applyGyro() {
+  if (!gyroEnabled) return;
+  const api = activeSensor();
+  if (!api) return;
+
+  let a;
+  if (api === 'orientation') {
+    a = accelFromOrientation();
+  } else {
+    a = accelFromMotion();
+  }
+
+  // Deadzone (für DeviceOrientation bereits in accelFromOrientation)
+  if (api !== 'orientation') {
+    if (Math.abs(a.x) < GYRO_DEAD) a.x = 0;
+    if (Math.abs(a.y) < GYRO_DEAD) a.y = 0;
+  }
+
+  targetAccel.x = a.x;
+  targetAccel.y = a.y;
+}
+
+// ── Gyro-Button  [FIX A: btnFlipY null-safe] ─────────────────────────────
 async function toggleGyro() {
   if (gyroEnabled) {
     gyroEnabled = false;
     targetAccel.x = 0; targetAccel.y = 0;
-    gyroBadge.classList.add('hidden');
-    btnGyro.classList.remove('active');
-    btnCalib.classList.add('hidden');
-    btnFlipY.classList.add('hidden');
+    if (gyroBadge) gyroBadge.classList.add('hidden');
+    if (btnGyro)   btnGyro.classList.remove('active');
+    if (btnCalib)  btnCalib.classList.add('hidden');
+    if (btnFlipY)  btnFlipY.classList.add('hidden');
+    if (btnFlipX)  btnFlipX.classList.add('hidden');
     dbgEl.style.opacity = '0';
     showToast('Gyroskop deaktiviert');
     return;
@@ -205,88 +256,110 @@ async function toggleGyro() {
     } catch { showToast('❌ Sensor-Fehler'); return; }
   }
 
-  // Sensor-Check: 600 ms warten, dann zählen ob Events ankamen
-  const nBefore = sensorCount;
-  showToast('⏳ Sensor wird geprüft…', 900);
-  await new Promise(r => setTimeout(r, 650));
+  // [FIX B] 800 ms warten, dann prüfen ob IRGENDEINE API Daten liefert
+  const oeBefore = oe.count;
+  const dmBefore = dm.count;
+  showToast('⏳ Sensor wird geprüft…', 1000);
+  await new Promise(r => setTimeout(r, 800));
 
-  if (sensorCount === nBefore || rawBeta === null) {
-    // Kein Signal → mit Diagnose-Hinweis abbrechen
+  const oeGot = oe.count > oeBefore;
+  const dmGot = dm.count > dmBefore;
+
+  if (!oeGot && !dmGot) {
     showToast(
-      '❌ Kein Gyro-Signal!\n' +
-      '→ Seite per HTTPS öffnen (Render ✓)\n' +
-      '→ Chrome: Einstellungen › Bewegungssensoren\n' +
-      '→ Gerät hat möglicherweise kein Gyroskop',
-      5000
+      '❌ Kein Sensor-Signal!\n' +
+      '1. Seite per HTTPS öffnen (Render ✓)\n' +
+      '2. Chrome › ⋮ › Einstellungen › Datenschutz\n' +
+      '   › Website-Einstellungen › Bewegungssensoren → Zulassen\n' +
+      '3. Oder: Adresszeile-Schloss › Website-Einstellungen',
+      6000
     );
     return;
   }
 
-  // Alles OK → aktivieren
+  const apiName = oeGot ? 'DeviceOrientation' : 'DeviceMotion';
   gyroEnabled  = true;
-  hasFirstGyro = false;   // kalibriert beim ersten Loop-Tick (FIX ③/④)
-  gyroBadge.classList.remove('hidden');
-  btnGyro.classList.add('active');
-  btnCalib.classList.remove('hidden');
-  btnFlipY.classList.remove('hidden');
-  showToast('📡 Gyro aktiv – Handy neigen zum Spielen');
+  hasFirstGyro = false;
+  if (gyroBadge) gyroBadge.classList.remove('hidden');
+  if (btnGyro)   btnGyro.classList.add('active');
+  if (btnCalib)  btnCalib.classList.remove('hidden');
+  if (btnFlipY)  btnFlipY.classList.remove('hidden');
+  if (btnFlipX)  btnFlipX.classList.remove('hidden');
+  showToast(`📡 Gyro aktiv [${apiName}] – Handy neigen!`);
 }
 
-// Neu-Kalibrierung: aktuelle Haltung = Nulllage
+// Neu-Kalibrierung
 function calibrateGyro() {
   hasFirstGyro = false;
   showToast('📐 Halte in Spielposition…', 1200);
 }
 
-// FIX ⑤: Y-Achse umkehren, falls Kugel falsch reagiert
+// Achsen umkehren [FIX E]
 function toggleFlipY() {
   flipY = !flipY;
-  btnFlipY.classList.toggle('active', flipY);
+  if (btnFlipY) btnFlipY.classList.toggle('active', flipY);
   showToast(flipY ? '↕ Y-Achse gespiegelt' : '↕ Y-Achse normal');
 }
+function toggleFlipX() {
+  flipX = !flipX;
+  if (btnFlipX) btnFlipX.classList.toggle('active', flipX);
+  showToast(flipX ? '↔ X-Achse gespiegelt' : '↔ X-Achse normal');
+}
 
-btnGyro.addEventListener('click',  toggleGyro);
-btnCalib.addEventListener('click', calibrateGyro);
-btnFlipY.addEventListener('click', toggleFlipY);
+// [FIX A] null-safe Event-Listener
+if (btnGyro)    btnGyro.addEventListener('click',  toggleGyro);
+if (btnCalib)   btnCalib.addEventListener('click', calibrateGyro);
+if (btnFlipY)   btnFlipY.addEventListener('click', toggleFlipY);
+if (btnFlipX)   btnFlipX.addEventListener('click', toggleFlipX);
 
-// ── FIX ⑥: Debug-Panel (live) ─────────────────────────────────────────────
+// ── [FIX F] Live-Diagnose-Panel ───────────────────────────────────────────
 const dbgEl = (() => {
   const el = document.createElement('div');
   Object.assign(el.style, {
-    position:'fixed', left:'10px', bottom:'88px', zIndex:'60',
-    padding:'9px 11px', borderRadius:'12px',
-    background:'rgba(7,10,18,.88)',
-    border:'1px solid rgba(122,169,255,.35)',
-    color:'#c8daff', fontSize:'11.5px',
-    fontFamily:'ui-monospace,SFMono-Regular,monospace',
-    pointerEvents:'none', whiteSpace:'pre', lineHeight:'1.5',
-    maxWidth:'min(340px,calc(100vw - 20px))',
-    opacity:'0', transition:'opacity .25s',
-    boxShadow:'0 4px 20px rgba(0,0,0,.4)',
+    position: 'fixed', left: '10px', bottom: '88px', zIndex: '60',
+    padding: '9px 12px', borderRadius: '12px',
+    background: 'rgba(7,10,18,.90)',
+    border: '1px solid rgba(122,169,255,.35)',
+    color: '#cce0ff', fontSize: '11px',
+    fontFamily: 'ui-monospace,SFMono-Regular,monospace',
+    pointerEvents: 'none', whiteSpace: 'pre', lineHeight: '1.6',
+    maxWidth: 'min(340px,calc(100vw - 20px))',
+    opacity: '0', transition: 'opacity .25s',
+    boxShadow: '0 4px 20px rgba(0,0,0,.45)',
   });
   document.body.appendChild(el);
   return el;
 })();
 
 function updateDebug() {
-  const show = gyroEnabled;
-  dbgEl.style.opacity = show ? '1' : '0';
-  if (!show) return;
-  const fresh = (Date.now() - sensorLastMs) < 900;
-  const sigIcon = fresh ? '🟢' : (sensorCount > 0 ? '🟡' : '🔴');
+  if (!gyroEnabled) { dbgEl.style.opacity = '0'; return; }
+  dbgEl.style.opacity = '1';
+
+  const now   = Date.now();
+  const oeAge = now - oe.lastMs;
+  const dmAge = now - dm.lastMs;
+  const api   = activeSensor();
+
+  const sig = (count, age) => {
+    if (count === 0) return '🔴 kein Signal';
+    if (age < 500)   return `🟢 aktiv (${count})`;
+    return            `🟡 veraltet (${count})`;
+  };
+
   dbgEl.textContent =
-    `Sensor  ${sigIcon} ${sensorCount} Events\n` +
-    `β raw   ${rawBeta  !== null ? rawBeta.toFixed(1).padStart(7) : '   null'}\n` +
-    `γ raw   ${rawGamma !== null ? rawGamma.toFixed(1).padStart(7) : '   null'}\n` +
-    `β-cal   ${(smoothBeta  - calibBeta).toFixed(1).padStart(7)}\n` +
-    `γ-cal   ${(smoothGamma - calibGamma).toFixed(1).padStart(7)}\n` +
-    `accel   x${targetAccel.x.toFixed(2)} y${targetAccel.y.toFixed(2)}\n` +
-    `flipY:${flipY}  rot:${getScreenRot()}°`;
+    `Aktives API : ${api ?? '⚠️ keines'}\n` +
+    `Orientation : ${sig(oe.count, oeAge)}\n` +
+    (oe.beta  !== null ? `  β=${oe.beta.toFixed(1)}° γ=${oe.gamma.toFixed(1)}°\n` : '') +
+    `Motion      : ${sig(dm.count, dmAge)}\n` +
+    (dm.x !== null ? `  x=${dm.x.toFixed(2)} y=${dm.y.toFixed(2)}\n` : '') +
+    `accel : x=${targetAccel.x.toFixed(2)} y=${targetAccel.y.toFixed(2)}\n` +
+    `flipX:${flipX}  flipY:${flipY}  rot:${getScreenRot()}°`;
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────
 let toastTimer = null;
-function showToast(msg, ms = 2200) {
+function showToast(msg, ms = 2400) {
+  if (!toast) return;
   toast.textContent = msg;
   toast.classList.remove('hidden');
   clearTimeout(toastTimer);
@@ -296,8 +369,7 @@ function showToast(msg, ms = 2200) {
 // ── Canvas-Größe ──────────────────────────────────────────────────────────
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const w = window.innerWidth, h = window.innerHeight;
   canvas.width  = Math.round(w * dpr);
   canvas.height = Math.round(h * dpr);
   canvas.style.width  = w + 'px';
@@ -310,15 +382,13 @@ resizeCanvas();
 
 // ── Hilfsfunktionen ───────────────────────────────────────────────────────
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-function hideOverlay() { overlay.classList.add('hidden'); }
-function showOverlay() { overlay.classList.remove('hidden'); }
+function hideOverlay() { overlay?.classList.add('hidden'); }
+function showOverlay() { overlay?.classList.remove('hidden'); }
 
-// ── Welt → Bildschirm-Koordinaten ────────────────────────────────────────
+// ── Welt → Bildschirm ────────────────────────────────────────────────────
 function worldToScreen(wx, wy) {
-  const W   = window.innerWidth;
-  const H   = window.innerHeight;
-  const tw  = level.world_width_tiles;
-  const th  = level.world_height_tiles;
+  const W = window.innerWidth, H = window.innerHeight;
+  const tw = level.world_width_tiles, th = level.world_height_tiles;
   const pad = 56;
   const tpx = Math.min((W - pad * 2) / tw, (H - pad * 2) / th);
   const ox  = (W - tpx * tw) / 2;
@@ -326,7 +396,7 @@ function worldToScreen(wx, wy) {
   return { sx: ox + wx * tpx, sy: oy + wy * tpx, tpx };
 }
 
-// ── Level vom Backend laden ───────────────────────────────────────────────
+// ── Level laden ───────────────────────────────────────────────────────────
 async function loadLevel() {
   const res = await fetch('/api/level');
   if (!res.ok) throw new Error(`Level HTTP ${res.status}`);
@@ -334,35 +404,28 @@ async function loadLevel() {
   tiles     = level.tiles;
   coins     = level.coins.map(c => ({ ...c, collected: false }));
   holeTiles = level.hole_tiles || [];
-  ball = {
-    pos: { x: level.start.x, y: level.start.y },
-    vel: { x: 0, y: 0 },
-    radius: 0.22,
-  };
+  ball = { pos: { x: level.start.x, y: level.start.y }, vel: { x:0, y:0 }, radius: 0.22 };
   score = 0;
-  scoreEl.textContent = '0';
-  coinsEl.textContent = `0/${coins.length}`;
-  timeEl.textContent  = '0.0s';
-  msgEl.textContent   = '';
+  if (scoreEl)  scoreEl.textContent  = '0';
+  if (coinsEl)  coinsEl.textContent  = `0/${coins.length}`;
+  if (timeEl)   timeEl.textContent   = '0.0s';
+  if (msgEl)    msgEl.textContent    = '';
   running = false;
-  btnRestart.disabled = true;
+  if (btnRestart) btnRestart.disabled = true;
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────
 function draw() {
   if (!level || !ball) return;
-  const W = window.innerWidth;
-  const H = window.innerHeight;
+  const W = window.innerWidth, H = window.innerHeight;
   ctx.clearRect(0, 0, W, H);
 
   const { sx: ox, sy: oy, tpx } = worldToScreen(0, 0);
-  const tw = level.world_width_tiles;
-  const th = level.world_height_tiles;
+  const tw = level.world_width_tiles, th = level.world_height_tiles;
 
   // Gitter
   ctx.save();
-  ctx.strokeStyle = 'rgba(130,160,255,.07)';
-  ctx.lineWidth = 0.5;
+  ctx.strokeStyle = 'rgba(130,160,255,.07)'; ctx.lineWidth = 0.5;
   for (let i = 0; i <= tw; i++) {
     const x = ox + i * tpx;
     ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + th * tpx); ctx.stroke();
@@ -373,7 +436,7 @@ function draw() {
   }
   ctx.restore();
 
-  // Wände (Außenfläche + Bevel)
+  // Wände
   ctx.fillStyle = '#2A3256';
   for (const t of tiles) if (t.type === 'WALL')
     ctx.fillRect(ox + t.x * tpx, oy + t.y * tpx, tpx + 0.5, tpx + 0.5);
@@ -384,10 +447,8 @@ function draw() {
   // Ziel
   for (const t of tiles) {
     if (t.type !== 'GOAL') continue;
-    const cx = ox + (t.x + 0.5) * tpx;
-    const cy = oy + (t.y + 0.5) * tpx;
-    const r  = tpx * 0.34;
-    const p  = 0.87 + 0.13 * Math.sin(Date.now() / 290);
+    const cx = ox + (t.x + 0.5) * tpx, cy = oy + (t.y + 0.5) * tpx;
+    const r = tpx * 0.34, p = 0.87 + 0.13 * Math.sin(Date.now() / 290);
     ctx.save();
     ctx.shadowColor = 'rgba(60,255,143,.75)'; ctx.shadowBlur = 14;
     ctx.fillStyle   = `rgba(60,255,143,${0.85 * p})`;
@@ -400,11 +461,8 @@ function draw() {
   // Münzen
   for (const t of tiles) {
     if (t.type !== 'COIN') continue;
-    const c = coins.find(c => c.x === t.x && c.y === t.y);
-    if (c?.collected) continue;
-    const cx = ox + (t.x + 0.5) * tpx;
-    const cy = oy + (t.y + 0.5) * tpx;
-    const r  = tpx * 0.19;
+    if (coins.find(c => c.x === t.x && c.y === t.y)?.collected) continue;
+    const cx = ox + (t.x + 0.5) * tpx, cy = oy + (t.y + 0.5) * tpx, r = tpx * 0.19;
     ctx.save();
     ctx.shadowColor = 'rgba(255,211,77,.5)'; ctx.shadowBlur = 6;
     ctx.fillStyle = '#FFD34D';
@@ -416,39 +474,31 @@ function draw() {
 
   // Löcher
   for (const t of holeTiles) {
-    const cx = ox + (t.x + 0.5) * tpx;
-    const cy = oy + (t.y + 0.5) * tpx;
-    const r  = tpx * 0.28;
+    const cx = ox + (t.x + 0.5) * tpx, cy = oy + (t.y + 0.5) * tpx, r = tpx * 0.28;
     ctx.save();
     ctx.shadowColor = 'rgba(110,76,255,.8)'; ctx.shadowBlur = 10;
     const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
-    g.addColorStop(0, 'rgba(20,0,60,1)');
-    g.addColorStop(1, 'rgba(110,76,255,.85)');
+    g.addColorStop(0, 'rgba(20,0,60,1)'); g.addColorStop(1, 'rgba(110,76,255,.85)');
     ctx.fillStyle = g;
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
 
   // Ball-Trail
-  const bcx = ox + ball.pos.x * tpx;
-  const bcy = oy + ball.pos.y * tpx;
-  const br  = ball.radius * tpx;
-  const tvx = ball.vel.x * tpx * 0.05;
-  const tvy = ball.vel.y * tpx * 0.05;
+  const bcx = ox + ball.pos.x * tpx, bcy = oy + ball.pos.y * tpx, br = ball.radius * tpx;
   ctx.save();
-  ctx.globalAlpha = 0.28;
-  ctx.strokeStyle = 'rgba(122,169,255,.9)';
-  ctx.lineWidth   = Math.max(1.5, br * 0.22);
-  ctx.lineCap     = 'round';
-  ctx.beginPath(); ctx.moveTo(bcx - tvx * 14, bcy - tvy * 14); ctx.lineTo(bcx, bcy); ctx.stroke();
+  ctx.globalAlpha = 0.28; ctx.strokeStyle = 'rgba(122,169,255,.9)';
+  ctx.lineWidth = Math.max(1.5, br * 0.22); ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(bcx - ball.vel.x * tpx * 0.7, bcy - ball.vel.y * tpx * 0.7);
+  ctx.lineTo(bcx, bcy); ctx.stroke();
   ctx.restore();
 
   // Ball
   ctx.save();
   ctx.shadowColor = 'rgba(122,169,255,.7)'; ctx.shadowBlur = 20;
   const bg = ctx.createRadialGradient(bcx - br * .3, bcy - br * .3, br * .05, bcx, bcy, br);
-  bg.addColorStop(0, '#B0CCFF');
-  bg.addColorStop(1, '#4078D8');
+  bg.addColorStop(0, '#B0CCFF'); bg.addColorStop(1, '#4078D8');
   ctx.fillStyle = bg;
   ctx.beginPath(); ctx.arc(bcx, bcy, br, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = 'rgba(255,255,255,.7)';
@@ -457,36 +507,29 @@ function draw() {
 
   // Joystick-Overlay
   if (joy.active && !gyroEnabled) {
-    const d   = Math.hypot(joy.dx, joy.dy);
-    const cl  = Math.min(d, JOY_R);
-    const ang = Math.atan2(joy.dy, joy.dx);
-    const kx  = joy.sx + Math.cos(ang) * cl;
-    const ky  = joy.sy + Math.sin(ang) * cl;
+    const d = Math.hypot(joy.dx, joy.dy), ang = Math.atan2(joy.dy, joy.dx);
+    const cl = Math.min(d, JOY_R);
+    const kx = joy.sx + Math.cos(ang) * cl, ky = joy.sy + Math.sin(ang) * cl;
     ctx.save();
-    ctx.globalAlpha = 0.48;
-    ctx.strokeStyle = 'rgba(122,169,255,.75)'; ctx.lineWidth = 1.5;
+    ctx.globalAlpha = 0.45; ctx.strokeStyle = 'rgba(122,169,255,.75)'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.arc(joy.sx, joy.sy, JOY_R, 0, Math.PI * 2); ctx.stroke();
-    ctx.globalAlpha = 0.7;
-    ctx.fillStyle = 'rgba(122,169,255,.3)';
+    ctx.globalAlpha = 0.7; ctx.fillStyle = 'rgba(122,169,255,.3)';
     ctx.beginPath(); ctx.arc(joy.sx, joy.sy, 13, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = 'rgba(255,255,255,.88)';
     ctx.beginPath(); ctx.arc(kx, ky, 20, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
 
-  // Gyro-Tilt-Kreis (Mini-Kompass oben rechts)
+  // Gyro-Tilt-Kreis
   if (gyroEnabled) {
-    const ix = W - 40, iy = 86, ir = 14;
-    ctx.save();
-    ctx.globalAlpha = 0.7;
+    const ix = W - 40, iy = 88, ir = 14;
+    ctx.save(); ctx.globalAlpha = 0.72;
     ctx.strokeStyle = 'rgba(122,169,255,.55)'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.arc(ix, iy, ir, 0, Math.PI * 2); ctx.stroke();
-    // Achsenlinien
-    ctx.strokeStyle = 'rgba(122,169,255,.25)';
+    ctx.strokeStyle = 'rgba(122,169,255,.2)';
     ctx.beginPath(); ctx.moveTo(ix - ir, iy); ctx.lineTo(ix + ir, iy); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(ix, iy - ir); ctx.lineTo(ix, iy + ir); ctx.stroke();
-    // Dot
-    ctx.fillStyle = 'rgba(122,169,255,.95)';
+    ctx.fillStyle = activeSensor() ? 'rgba(122,169,255,.95)' : '#FF5A5A';
     ctx.beginPath();
     ctx.arc(ix + targetAccel.x * ir, iy + targetAccel.y * ir, 4.5, 0, Math.PI * 2);
     ctx.fill();
@@ -494,7 +537,7 @@ function draw() {
   }
 }
 
-// ── Physik-Tick (HTTP → Backend) ─────────────────────────────────────────
+// ── Physik-Tick ───────────────────────────────────────────────────────────
 let physicsInFlight = false;
 async function physicsTick(dt) {
   if (!running || physicsInFlight) return;
@@ -503,35 +546,29 @@ async function physicsTick(dt) {
     const resp = await fetch('/api/step', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        accel:      { x: targetAccel.x, y: targetAccel.y },
-        dt_seconds: dt,
-        ball,
-        tiles,
-        coins,
-      }),
+      body: JSON.stringify({ accel: { x: targetAccel.x, y: targetAccel.y },
+                             dt_seconds: dt, ball, tiles, coins }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const out = await resp.json();
-
     ball  = out.ball;
     coins = out.coins;
-
     if (out.score_delta) {
       score += out.score_delta;
-      scoreEl.textContent = String(score);
+      if (scoreEl) scoreEl.textContent = String(score);
     }
-    const collected = coins.filter(c => c.collected).length;
-    coinsEl.textContent = `${collected}/${coins.length}`;
-
+    const coll = coins.filter(c => c.collected).length;
+    if (coinsEl) coinsEl.textContent = `${coll}/${coins.length}`;
     if (out.game_over) {
-      running = false; btnRestart.disabled = false;
-      msgEl.textContent = '💥 Game Over – Ins Loch gefallen!';
+      running = false;
+      if (btnRestart) btnRestart.disabled = false;
+      if (msgEl) msgEl.textContent = '💥 Game Over – Ins Loch gefallen!';
       showOverlay(); return;
     }
     if (out.level_completed) {
-      running = false; btnRestart.disabled = false;
-      msgEl.textContent = `🎉 Level geschafft! +${out.score_delta} Punkte!`;
+      running = false;
+      if (btnRestart) btnRestart.disabled = false;
+      if (msgEl) msgEl.textContent = `🎉 Level geschafft! +${out.score_delta} Punkte!`;
       showOverlay(); return;
     }
   } catch (err) {
@@ -547,12 +584,12 @@ function loop(ts) {
 
   const dt = Math.min(0.04, (ts - lastTs) / 1000 || 0.016);
   lastTs = ts;
-  timeEl.textContent = ((ts - startTs) / 1000).toFixed(1) + 's';
+  if (timeEl) timeEl.textContent = ((ts - startTs) / 1000).toFixed(1) + 's';
 
-  // Eingabe-Priorität: Gyro > Joystick > Tastatur > Abklingen
+  // Priorität: Gyro > Joystick > Tastatur > Abklingen
   if (gyroEnabled) {
-    applyGyro();             // FIX ③: im Loop anwenden, nicht im Event-Handler
-    updateDebug();           // FIX ⑥: Debug-Panel live aktualisieren
+    applyGyro();
+    updateDebug();
   } else if (joy.active) {
     const j = accelFromJoy();
     targetAccel.x = j.x; targetAccel.y = j.y;
@@ -574,41 +611,36 @@ function loop(ts) {
 function startGame() {
   if (!level) return;
   running = true;
-
-  // FIX ④: Gyro-Kalibrierung NICHT zurücksetzen (keine Null-Initialisierung)
-  // Nur hasFirstGyro = false → beim 1. Loop-Tick wird mit echter Sensorlage kalibriert
+  // [FIX] nur hasFirstGyro zurücksetzen, smoothed-Werte NICHT auf 0
   if (gyroEnabled) hasFirstGyro = false;
-
   hideOverlay();
-  btnRestart.disabled = false;
-  startTs = performance.now();
-  lastTs  = startTs;
-  targetAccel.x = 0;
-  targetAccel.y = 0;
+  if (btnRestart) btnRestart.disabled = false;
+  startTs = performance.now(); lastTs = startTs;
+  targetAccel.x = 0; targetAccel.y = 0;
   requestAnimationFrame(loop);
 }
 
 // ── Button-Handler ────────────────────────────────────────────────────────
-btnStart.addEventListener('click', async () => {
+btnStart?.addEventListener('click', async () => {
   try {
-    btnStart.disabled = true;
+    if (btnStart) btnStart.disabled = true;
     await loadLevel();
     startGame();
   } catch (e) {
-    msgEl.textContent = `Fehler: ${e.message}`;
-    btnStart.disabled = false;
+    if (msgEl) msgEl.textContent = `Fehler: ${e.message}`;
+    if (btnStart) btnStart.disabled = false;
   }
 });
 
-btnRestart.addEventListener('click', async () => {
+btnRestart?.addEventListener('click', async () => {
   try {
-    btnRestart.disabled = true;
+    if (btnRestart) btnRestart.disabled = true;
     running = false;
     await loadLevel();
     startGame();
   } catch (e) {
     console.error(e);
-    btnRestart.disabled = false;
+    if (btnRestart) btnRestart.disabled = false;
   }
 });
 
@@ -619,7 +651,7 @@ btnRestart.addEventListener('click', async () => {
     draw();
     showOverlay();
   } catch (e) {
-    msgEl.textContent = `Verbindungsfehler: ${e.message}`;
+    if (msgEl) msgEl.textContent = `Verbindungsfehler: ${e.message}`;
     showOverlay();
   }
 })();
