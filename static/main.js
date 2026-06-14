@@ -104,49 +104,65 @@ function accelFromJoy() {
 
 // ── Gyroscope ─────────────────────────────────────────────────────────────
 let gyroEnabled    = false;
-let calibBeta      = 45;   // neutral beta (phone held ~45° from flat)
-let calibGamma     = 0;
-let smoothedBeta   = 45;
-let smoothedGamma  = 0;
 let hasFirstGyro   = false;
 
-const GYRO_ALPHA   = 0.80;  // low-pass filter (0 = raw, 1 = frozen)
-const GYRO_RANGE   = 28;    // degrees tilt for max acceleration
-const GYRO_DEAD    = 0.04;
+// Calibration offsets (neutral orientation)
+let calibBeta      = 0;
+let calibGamma     = 0;
 
-function onDeviceOrientation(e) {
-  if (!gyroEnabled) return;
-  const beta  = e.beta  ?? 0;
-  const gamma = e.gamma ?? 0;
+// Smoothed raw sensor values
+let smoothedBeta   = 0;
+let smoothedGamma  = 0;
 
-  // Auto-calibrate on first reading so current hold = neutral
-  if (!hasFirstGyro) {
-    calibBeta  = beta;
-    calibGamma = gamma;
-    smoothedBeta  = beta;
-    smoothedGamma = gamma;
-    hasFirstGyro  = true;
-  }
+// Tunables (Android-friendly)
+const GYRO_ALPHA   = 0.78; // low-pass filter
+const GYRO_RANGE   = 35;   // degrees tilt for max acceleration
+const GYRO_DEAD    = 0.05; // deadzone to fight drift
 
-  // Low-pass filter
-  smoothedBeta  = GYRO_ALPHA * smoothedBeta  + (1 - GYRO_ALPHA) * beta;
-  smoothedGamma = GYRO_ALPHA * smoothedGamma + (1 - GYRO_ALPHA) * gamma;
+// axis mapping: convert (beta,gamma) into game-space accel (x,y)
+function gyroToAccel(beta, gamma) {
+  // Typical Android mapping (portrait):
+  // - gamma (left/right tilt) -> x acceleration
+  // - beta  (front/back tilt) -> y acceleration (often inverted)
+  let ax = clamp((gamma - calibGamma) / GYRO_RANGE, -1, 1);
+  let ay = clamp((beta  - calibBeta)  / GYRO_RANGE, -1, 1);
 
-  let ax = clamp((smoothedGamma - calibGamma) / GYRO_RANGE, -1, 1);
-  let ay = clamp((smoothedBeta  - calibBeta)  / GYRO_RANGE, -1, 1);
+  // Make “neigen” feel natural: invert Y so pushing the top of the phone away moves down/up as expected.
+  ay *= -1;
 
+  // Deadzone
   if (Math.abs(ax) < GYRO_DEAD) ax = 0;
   if (Math.abs(ay) < GYRO_DEAD) ay = 0;
 
-  // While joystick is being dragged, blend joystick on top of gyro
-  if (joy.active) {
-    const j = accelFromJoy();
-    ax = j.x;
-    ay = j.y;
+  return { x: ax, y: ay };
+}
+
+function onDeviceOrientation(e) {
+  if (!gyroEnabled || !running) return;
+
+  // Some browsers send null/undefined on first events
+  const beta  = (e.beta  ?? 0);
+  const gamma = (e.gamma ?? 0);
+
+  // First reading becomes neutral (so holding phone still = no motion)
+  if (!hasFirstGyro) {
+    calibBeta = beta;
+    calibGamma = gamma;
+    smoothedBeta = beta;
+    smoothedGamma = gamma;
+    hasFirstGyro = true;
   }
 
-  targetAccel.x = ax;
-  targetAccel.y = ay;
+  // Low-pass filter (reduce jitter)
+  smoothedBeta  = GYRO_ALPHA * smoothedBeta  + (1 - GYRO_ALPHA) * beta;
+  smoothedGamma = GYRO_ALPHA * smoothedGamma + (1 - GYRO_ALPHA) * gamma;
+
+  // Convert to game accel
+  const a = gyroToAccel(smoothedBeta, smoothedGamma);
+
+  // Gyro has hard priority: ignore joystick while gyro is active
+  targetAccel.x = a.x;
+  targetAccel.y = a.y;
 }
 
 async function toggleGyro() {
@@ -158,9 +174,12 @@ async function toggleGyro() {
     gyroBadge.classList.add('hidden');
     btnGyro.classList.remove('active');
     btnCalib.classList.add('hidden');
+    // Remove listener to avoid duplicate handlers after toggling
+    window.removeEventListener('deviceorientation', onDeviceOrientation);
     showToast('Gyroskop deaktiviert');
     return;
   }
+
 
   // iOS Safari needs explicit permission
   if (typeof DeviceOrientationEvent !== 'undefined' &&
@@ -193,10 +212,13 @@ async function toggleGyro() {
 }
 
 function calibrateGyro() {
+  // Use current smoothed values as neutral reference
   calibBeta  = smoothedBeta;
   calibGamma = smoothedGamma;
+  hasFirstGyro = true;
   showToast('Kalibriert! Aktuelle Position = Neutral');
 }
+
 
 btnGyro.addEventListener('click', toggleGyro);
 btnCalib.addEventListener('click', calibrateGyro);
