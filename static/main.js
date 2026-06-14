@@ -119,16 +119,57 @@ const GYRO_ALPHA   = 0.78; // low-pass filter
 const GYRO_RANGE   = 35;   // degrees tilt for max acceleration
 const GYRO_DEAD    = 0.05; // deadzone to fight drift
 
+function getScreenRotationDeg() {
+  // Best-effort mapping for device rotation.
+  // Returns 0/90/180/270 (portrait baseline = 0).
+  let angle = 0;
+  try {
+    if (screen?.orientation && typeof screen.orientation.angle === 'number') {
+      angle = screen.orientation.angle;
+    } else if (typeof window.orientation === 'number') {
+      // legacy iOS/Android: 0, +/-90, 180
+      angle = window.orientation;
+    }
+  } catch (_) {}
+
+  // normalize
+  angle = ((angle % 360) + 360) % 360;
+  // quantize to multiples of 90
+  angle = Math.round(angle / 90) * 90;
+  angle = ((angle % 360) + 360) % 360;
+  return angle;
+}
+
 // axis mapping: convert (beta,gamma) into game-space accel (x,y)
 function gyroToAccel(beta, gamma) {
   // Typical Android mapping (portrait):
   // - gamma (left/right tilt) -> x acceleration
   // - beta  (front/back tilt) -> y acceleration (often inverted)
-  let ax = clamp((gamma - calibGamma) / GYRO_RANGE, -1, 1);
-  let ay = clamp((beta  - calibBeta)  / GYRO_RANGE, -1, 1);
+
+  let axPortrait = clamp((gamma - calibGamma) / GYRO_RANGE, -1, 1);
+  let ayPortrait = clamp((beta  - calibBeta)  / GYRO_RANGE, -1, 1);
 
   // Make “neigen” feel natural: invert Y so pushing the top of the phone away moves down/up as expected.
-  ay *= -1;
+  ayPortrait *= -1;
+
+  // Rotate mapping into current screen orientation.
+  // rotation=0: portrait -> (x,y) = (axPortrait, ayPortrait)
+  // rotation=90: rotate right -> (x,y) = (ayPortrait, -axPortrait)
+  // rotation=180: -> (x,y) = (-axPortrait, -ayPortrait)
+  // rotation=270: -> (x,y) = (-ayPortrait, axPortrait)
+  const rot = getScreenRotationDeg();
+  let ax = axPortrait;
+  let ay = ayPortrait;
+  if (rot === 90) {
+    ax = ayPortrait;
+    ay = -axPortrait;
+  } else if (rot === 180) {
+    ax = -axPortrait;
+    ay = -ayPortrait;
+  } else if (rot === 270) {
+    ax = -ayPortrait;
+    ay = axPortrait;
+  }
 
   // Deadzone
   if (Math.abs(ax) < GYRO_DEAD) ax = 0;
@@ -137,12 +178,19 @@ function gyroToAccel(beta, gamma) {
   return { x: ax, y: ay };
 }
 
+
 function onDeviceOrientation(e) {
   if (!gyroEnabled || !running) return;
 
-  // Some browsers send null/undefined on first events
-  const beta  = (e.beta  ?? 0);
-  const gamma = (e.gamma ?? 0);
+  const betaRaw = e.beta;
+  const gammaRaw = e.gamma;
+
+  // Many Android browsers can send null/undefined or NaN until permission/first update.
+  // In that case we simply ignore the event.
+  if (betaRaw == null || gammaRaw == null) return;
+  const beta = Number(betaRaw);
+  const gamma = Number(gammaRaw);
+  if (!Number.isFinite(beta) || !Number.isFinite(gamma)) return;
 
   // First reading becomes neutral (so holding phone still = no motion)
   if (!hasFirstGyro) {
@@ -165,6 +213,7 @@ function onDeviceOrientation(e) {
   targetAccel.y = a.y;
 }
 
+
 async function toggleGyro() {
   if (gyroEnabled) {
     gyroEnabled = false;
@@ -179,6 +228,14 @@ async function toggleGyro() {
     showToast('Gyroskop deaktiviert');
     return;
   }
+
+  // reset neutral state so first valid event re-calibrates
+  hasFirstGyro = false;
+  calibBeta = 0;
+  calibGamma = 0;
+  smoothedBeta = 0;
+  smoothedGamma = 0;
+
 
 
   // iOS Safari needs explicit permission
