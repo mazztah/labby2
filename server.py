@@ -26,6 +26,17 @@ app.add_middleware(
 )
 
 
+# Permissions-Policy header: Chrome on Android needs this to allow sensor APIs
+# (DeviceOrientationEvent / DeviceMotionEvent) in some security contexts.
+@app.middleware("http")
+async def add_permissions_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Permissions-Policy"] = (
+        "accelerometer=*, gyroscope=*, magnetometer=*"
+    )
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
